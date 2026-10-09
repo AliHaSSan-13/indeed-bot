@@ -29,6 +29,13 @@ SEARCH_SETTLE_SECONDS = 10
 # How long an opened job page rests after its document content is ready.
 JOB_PAGE_SETTLE_SECONDS = 5
 
+# Tracking and logging endpoints that add load and contribute to 429s.
+BLOCKED_ROUTES = [
+    "**/log**",
+    "**/telemetry**",
+    "**/analytics**",
+]
+
 # Primary Apply button on a job page, with a text/testid fallback below it.
 APPLY_BTN_XPATH = "/html/body/div[1]/div[2]/div/div/div/div[2]/div/div/div/div/div/div/div/div[2]/div[4]/div[1]/div"
 APPLY_BTN_SELECTOR = (
@@ -40,6 +47,29 @@ APPLY_BTN_SELECTOR = (
 # a /form/<module> route, so the landing has to be waited on by URL - the SPA
 # route change fires no load event for wait_for_load_state() to see.
 FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
+
+# Submitted applications land on a post-apply route.
+POST_APPLY_RE = re.compile(r"post-apply")
+
+# Review module
+SUBMIT_BTN_SELECTOR = '[data-testid="submit-application-button"]:visible'
+
+# Tail of the prompt Indeed shows when a human has to clear something (captcha,
+# unanswered screening question) before the module will advance.
+MANUAL_INPUT_RE = re.compile(r"to continue", re.IGNORECASE)
+
+# Tried in order on every non-review module. Each carries :visible because the SPA
+# keeps all its modules mounted and hides the inactive ones, so a hidden module's
+# button would otherwise be picked by .first and block forever on a visibility wait.
+ACTION_BUTTON_SELECTORS = [
+    '[data-testid="continue-button"]:visible',
+    SUBMIT_BTN_SELECTOR,
+    'button[type="submit"]:visible',
+    'button:has-text("Continue"):visible',
+    'button:has-text("Next"):visible',
+    '[aria-label*="Continue"]:visible',
+    'button:visible',
+]
 
 
 def load_config(path=CONFIG_PATH):
@@ -66,6 +96,14 @@ def start_browser(camoufox_config):
         persistent_context=True,
         humanize=True,
     )
+
+
+def block_tracking(browser):
+    """Abort tracking/logging requests. Set on the context so every new tab is covered."""
+    # Camoufox yields a BrowserContext when persistent_context=True, else a Browser.
+    context = getattr(browser, "context", browser)
+    for pattern in BLOCKED_ROUTES:
+        context.route(pattern, lambda route: route.abort())
 
 
 def ensure_login(page, browser, language, logger):
@@ -106,7 +144,7 @@ def build_search_urls(search_config):
     return urls
 
 
-def collect_indeed_apply_links(page, language):
+def collect_indeed_apply_links(page, language = "www"):
     """
     Collect all 'Easily apply' job links from the current Indeed search result page.
     """
@@ -159,6 +197,12 @@ def scrape_page(page, url, language, logger):
 
 def click_apply_now(page):
     """Click the primary Apply now button on an open job page."""
+    if page.title() == "Just a moment...":
+        print("Solving CAPTCHA...")
+        page.wait_for_load_state("networkidle")
+        page.mouse.click(627,215)
+        print("CAPTCHA solved! 🎉")
+        time.sleep(5)
     apply_btn = page.query_selector(f"xpath={APPLY_BTN_XPATH}")
     if apply_btn is None:
         apply_btn = page.locator(APPLY_BTN_SELECTOR).first
@@ -169,10 +213,112 @@ def click_apply_now(page):
     return label
 
 
-def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS):
+def find_action_button(page, timeout=20):
+    """Poll the CTA selector chain until a visible match appears; return it or None."""
+    deadline = time.time() + timeout
+    while True:
+        for selector in ACTION_BUTTON_SELECTORS:
+            candidate = page.locator(selector)
+            if candidate.count() > 0 and candidate.first.is_visible():
+                return candidate.first
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
+def submit_review_module(page, job_url):
+    """Clear the captcha if present, submit, and confirm via the landing URL."""
+    time.sleep(10)
+    # Scrool to the bottom of the page to find the CAPTCHA checkbox.
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.mouse.click(589,2688)
+    print("Clicking CAPTCHA checkbox")
+    time.sleep(2)
+
+    submit_btn = page.locator(SUBMIT_BTN_SELECTOR)
+    try:
+        submit_btn.wait_for(state="visible", timeout=15000)
+    except PWTimeout:
+        print(f"Submit button never appeared for {job_url}")
+        return False
+
+    if submit_btn.first.is_disabled():
+        print(f"Submit still disabled after CAPTCHA, discarding {job_url}")
+        return False
+
+    print("Clicking 'Submit your application'")
+    try:
+        submit_btn.first.click(timeout=15000)
+    except PWTimeout as e:
+        print(f"Submit click failed: {str(e).splitlines()[0]}")
+        return False
+
+    try:
+        page.wait_for_url(POST_APPLY_RE, timeout=30000)
+    except PWTimeout:
+        print(f"No post-apply confirmation, stalled at: {page.url}")
+        return False
+
+    print(f"Applied successfully to {job_url}")
+    return True
+
+
+def submit_application(page, job_url, max_steps=10):
+    """Drive the smartapply modules until the application is submitted."""
+    step = 0
+
+    while step < max_steps:
+        print(f"[step {step}] {page.url}")
+
+        if "post-apply" in page.url:
+            print(f"Applied successfully to {job_url}")
+            return True
+
+        if "review-module" in page.url:
+            return submit_review_module(page, job_url)
+
+        action_btn = find_action_button(page)
+        if action_btn is None:
+            print(f"Could not find action button at step {step} for {job_url}")
+            return False
+
+        if action_btn.is_disabled():
+            print(f"Form incomplete at step {step}, action button disabled, for {job_url}")
+            return False
+
+        print(f"[step {step}] clicking {action_btn.inner_text().strip()[:30]!r}")
+        try:
+            action_btn.click(timeout=15000)
+        except PWTimeout as e:
+            print(f"Click failed at step {step}: {str(e).splitlines()[0]}")
+            step += 1
+            continue
+
+        time.sleep(2)
+
+        if page.get_by_text(MANUAL_INPUT_RE).count() > 0:
+            print("Please fill the required fields manually")
+            input("Press Enter to continue after filling the required fields: ")
+
+        step += 1
+
+    if "post-apply" in page.url:
+        print(f"Applied successfully to {job_url}")
+        return True
+
+    print(f"Failed to apply to {job_url}")
+    return False
+
+
+def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS, language="www"):
     """Open one job URL in a new tab of the same window and let it settle."""
-    print(f"Opening: {job_url}")
+    
     page = browser.new_page()
+    # Always start at the Indeed homepage, so we dont get 429 errors.
+    page.goto(f"https://{language}.indeed.com")
+    time.sleep(settle_seconds)
+
+    print(f"Opening: {job_url}")
     page.goto(job_url)
     page.wait_for_load_state("domcontentloaded")
     time.sleep(settle_seconds)
@@ -192,6 +338,7 @@ def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS):
         click_apply_now(page)
         page.wait_for_url(FORM_URL_RE, timeout=45000)
         print(f"Now applying at: {page.url}")
+        submit_application(page, job_url)
         input("Press Enter to close the browser - After applying")
     except PWTimeout:
         print(f"Apply did not reach the smartapply form, stalled at: {page.url}")
@@ -206,6 +353,7 @@ def main():
     language = camoufox_config.get("language")
 
     with start_browser(camoufox_config) as browser:
+        block_tracking(browser)
         page = browser.new_page()
 
         if not ensure_login(page, browser, language, logger):
@@ -221,7 +369,7 @@ def main():
 
         for job_url in job_links:
             try:
-                open_job_page(browser, job_url)
+                open_job_page(browser, job_url, language=language)
             except Exception as e:
                 logger.error(f"Failed to open {job_url}: {str(e).splitlines()[0]}")
 
