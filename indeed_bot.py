@@ -1,53 +1,93 @@
 """
 Indeed Auto-Apply Bot
 ---------------------
-Automates job applications on Indeed using Camoufox.
+Starts the browser, verifies the login session, scrapes the Easy Apply job
+links from the configured search pages, dedupes them and prints the list.
 
 Usage:
-  - Configure your search and Chrome settings in config.yaml
+  - Configure your search and Camoufox settings in config.yaml
   - Run: python indeed_bot.py
 
 Author: @meteor314 
 License: MIT
 """
-import yaml
-import time
-import re
-import sys
-import select
-from camoufox.sync_api import Camoufox
-from playwright.sync_api import TimeoutError as PWTimeout
 import logging
+import sys
+import time
+
+import yaml
+from camoufox.sync_api import Camoufox
 
 
-# The smartapply entry point is an SPA: clicking Apply lands on a bootstrap URL
-# that the app's router then swaps for a /form/<module> route.
-FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
+CONFIG_PATH = "config.yaml"
 
-SUBMIT_BTN_SEL = '[data-testid="submit-application-button"]:visible'
-
-# Tail of the prompt Indeed shows when a human has to clear something (captcha,
-# unanswered screening question) before the module will advance.
-MANUAL_INPUT_RE = re.compile(r"to continue", re.IGNORECASE)
-
-# Seconds the operator gets to answer a blocking prompt before the job is discarded.
-USER_INPUT_TIMEOUT = 120
-
-ACTION_BUTTON_SELECTORS = [
-    '[data-testid="continue-button"]:visible',
-    SUBMIT_BTN_SEL,
-    'button[type="submit"]:visible',
-    'button:has-text("Continue"):visible',
-    'button:has-text("Next"):visible',
-    '[aria-label*="Continue"]:visible',
-]
+# How long each search page gets to settle, so a cloudflare check can be clicked.
+SEARCH_SETTLE_SECONDS = 10
+PAGE_GAP_SECONDS = 5
 
 
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
-camoufox_config = config.get("camoufox", {})
-user_data_dir = camoufox_config.get("user_data_dir")
-language = camoufox_config.get("language")
+def load_config(path=CONFIG_PATH):
+    """Read config.yaml."""
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def setup_logger():
+    """Log to the terminal only."""
+    logger = logging.getLogger("indeed_apply")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+    logger.addHandler(handler)
+    return logger
+
+
+def start_browser(camoufox_config):
+    """Launch Camoufox with the settings from config.yaml."""
+    return Camoufox(
+        user_data_dir=camoufox_config.get("user_data_dir"),
+        persistent_context=True,
+        humanize=True,
+    )
+
+
+def ensure_login(page, browser, language, logger):
+    """Return True if a PPID session cookie is present, otherwise prompt for a login."""
+    page.goto("https://" + language + ".indeed.com")
+
+    cookies = page.context.cookies()
+    ppid_cookie = next((cookie for cookie in cookies if cookie['name'] == 'PPID'), None)
+    if ppid_cookie:
+        logger.info("Token found, proceeding with job search...")
+        return True
+
+    try:
+        print("Token not found, please log in to Indeed first.")
+        print("Redirecting to login page...")
+        print("You need  to restart the bot after logging in.")
+        page.goto("https://secure.indeed.com/auth?hl=" + language)
+        input("Press Enter to close the browser - After logging in")
+        print("Closing browser")
+        browser.close()
+    except Exception as e:
+        print("Error logging in ,Please try again")
+        print(e)
+    return False
+
+
+def build_search_urls(search_config):
+    """One results URL per page between start and end, 10 jobs apart."""
+    base_url = search_config.get("base_url", "")
+    start = int(search_config.get("start", 0))
+    end = int(search_config.get("end", 0))
+
+    urls = []
+    offset = start
+    while offset <= end:
+        urls.append(f"{base_url}&start={offset}")
+        offset += 10
+    return urls
 
 
 def collect_indeed_apply_links(page, language):
@@ -80,222 +120,50 @@ def collect_indeed_apply_links(page, language):
                 
     return links
 
-def click_and_wait(element, timeout=5):
-    if element:
-        element.click()
-        time.sleep(timeout)
 
-
-def find_action_button(page, timeout=20):
-    """Poll the CTA selector chain until a visible match appears; return it or None."""
-    deadline = time.time() + timeout
-    while True:
-        for selector in ACTION_BUTTON_SELECTORS:
-            candidate = page.locator(selector)
-            if candidate.count() > 0 and candidate.first.is_visible():
-                return candidate.first
-        if time.time() >= deadline:
-            return None
-        time.sleep(0.5)
-
-def prompt_user(message, timeout=USER_INPUT_TIMEOUT):
-    """Wait for Enter, give up after `timeout` seconds. False if the operator went quiet."""
-    if not sys.stdin.isatty():
-        print(f"{message} (stdin is not a terminal, timeout disabled)")
-        sys.stdin.readline()
-        return True
-    print(f"{message} (Enter within {timeout}s, otherwise job is discarded) ", end="", flush=True)
-    if not select.select([sys.stdin], [], [], timeout)[0]:
-        print("\nNo response, discarding job.")
-        return False
-    sys.stdin.readline()
-    return True
-
-def apply_to_job(browser, job_url, logger):
-    """Open a new tab, apply to the job using dynamic step navigation, log the result, and close the tab."""
-    page = browser.new_page()
-    page.set_default_timeout(15000)
+def scrape_page(page, url, language, logger):
+    """Load one search results page and return its Easy Apply job links."""
+    print(f"Visiting URL: {url}")
+    page.goto(url)
+    page.wait_for_load_state("domcontentloaded")
+    print(
+        "Waiting for page to load, if any cloudflare protection button appears... please click it.")
+    #Will be adding auto detector and resolver for this
+    time.sleep(SEARCH_SETTLE_SECONDS)
 
     try:
-        page.goto(job_url, wait_until="domcontentloaded", timeout=45000)
-        time.sleep(5)
-
-        # 1. Click the primary "Apply Now" / "Easily Apply" button on the job page
-        apply_btn_xpath = "/html/body/div[1]/div[2]/div/div/div/div[2]/div/div/div/div/div/div/div/div[2]/div[4]/div[1]/div"
-        apply_btn = page.query_selector(f"xpath={apply_btn_xpath}")
-        if apply_btn is None:
-            apply_btn = page.locator(
-                'a:has-text("Apply now"), button:has-text("Apply now"), '
-                'a:has-text("Easily apply"), [data-testid*="apply"]'
-            ).first
-            apply_btn.wait_for(state="visible", timeout=15000)
-        apply_btn.click(timeout=15000)
-
-        # 2. Wait for the smartapply SPA to swap its bootstrap URL for a /form/ route.
-        #    wait_for_load_state() does not fire on client-side routing, so the URL
-        #    must be waited on explicitly instead of sleeping a fixed amount.
-        try:
-            page.wait_for_url(FORM_URL_RE, timeout=45000)
-        except PWTimeout:
-            logger.warning(f"Never reached smartapply form, stalled at {page.url}")
-
-        # 3. Multi-step form loop (handles smartapply pages)
-        max_steps = 10
-        step = 0
-
-        while step < max_steps:
-            logger.info(f"[step {step}] {page.url}")
-
-            # Check for successful completion
-            if "post-apply" in page.url:
-                logger.info(f"Applied successfully to {job_url}")
-                page.close()
-                return True
-            if "review-module" in page.url:
-                #Give the Loader time to genrate the review module
-                time.sleep(10)
-                # Last step: its only CTA is "Submit your application".
-                submit_btn = page.locator(SUBMIT_BTN_SEL)
-                while True:
-                    try:
-                        submit_btn.wait_for(state="visible", timeout=15000)
-                    except PWTimeout:
-                        logger.warning(f"Submit button never appeared on review module for {job_url}")
-                        if not prompt_user(f"Press Enter to continue for {job_url}: "):
-                            page.close()
-                            return False
-
-                    if submit_btn.is_disabled():
-                        # Indeed keeps submission disabled until this module's CAPTCHA is solved.
-                        logger.warning(f"Captcha required for {job_url}")
-                        if not prompt_user(f"Solve the captcha then press Enter for {job_url}: "):
-                            page.close()
-                            return False
-                        continue
-
-                    logger.info(f"[step {step}] clicking 'Submit your application'")
-                    try:
-                        submit_btn.click(timeout=15000)
-                    except PWTimeout as e:
-                        logger.warning(f"Submit click failed for {job_url}: {str(e).splitlines()[0]}")
-                        page.close()
-                        return False
-
-                    step += 1
-                    time.sleep(2)
-                    break
-
-            # Gate on the DOM, not the URL: the module must hydrate before its buttons exist.
-            action_btn = find_action_button(page)
-            if action_btn is None:
-                logger.warning(f"Could not find action button at step {step} for {job_url}")
-                break
-
-            # Indeed keeps the CTA disabled until every required field is filled.
-            if action_btn.is_disabled():
-                logger.warning(f"Form incomplete at step {step}, action button disabled, for {job_url}")
-                break
-
-            logger.info(f"[step {step}] clicking {action_btn.inner_text().strip()[:30]!r}")
-            try:
-                action_btn.click(timeout=15000)
-            except PWTimeout as e:
-                logger.warning(f"Click failed at step {step} for {job_url}: {str(e).splitlines()[0]}")
-                step += 1
-                continue
-
-            time.sleep(2)
-
-            if page.get_by_text(MANUAL_INPUT_RE).count() > 0:
-                logger.warning("Please fill the required fields manually")
-                if not prompt_user(f"Press Enter after filling the required fields for {job_url}: "):
-                    page.close()
-                    return False
-
-            step += 1
-
-        # Verification check after step loop finishes
-        if "post-apply" in page.url:
-            logger.info(f"Applied successfully to {job_url}")
-            page.close()
-            return True
-
-        logger.warning(f"Failed to apply to {job_url}")
-        page.close()
-        return False
-
+        links = collect_indeed_apply_links(page, language)
     except Exception as e:
-        logger.exception(f"Error applying to {job_url}: {e}")
-        page.close()
-        return False
+        logger.error(f"Error extracting jobs from {url}: {e}")
+        links = []
 
-def setup_logger():
-    logger = logging.getLogger("indeed_apply")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
-    logger.addHandler(handler)
-    return logger
+    print(f"Found {len(links)} Indeed Apply jobs on this page.")
+    return links
 
 
-with Camoufox(user_data_dir=user_data_dir,
-              persistent_context=True) as browser:
+def main():
     logger = setup_logger()
-    page = browser.new_page()
-    page.goto("https://" + language + ".indeed.com")
+    config = load_config()
+    camoufox_config = config.get("camoufox", {})
+    search_config = config.get("search", {})
+    language = camoufox_config.get("language")
 
-    cookies = page.context.cookies()
-    ppid_cookie = next(
-        (cookie for cookie in cookies if cookie['name'] == 'PPID'), None)
-    if not ppid_cookie:
-        try:
-            print("Token not found, please log in to Indeed first.")
-            print("Redirecting to login page...")
-            print("You need  to restart the bot after logging in.")
-            page.goto("https://secure.indeed.com/auth?hl=" + language)
-            input("Press Enter to close the browser - After logging in")
-            print("Closing browser")
-            browser.close()
-        except Exception as e:
-            print("Error logging in ,Please try again")
-            print(e)
-    else:
-        print("Token found, proceeding with job search...")
-        search_config = config.get("search", {})
-        base_url = search_config.get("base_url", "")
-        start = search_config.get("start", "")
-        end = search_config.get("end", "")
+    with start_browser(camoufox_config) as browser:
+        page = browser.new_page()
 
-        listURL = []
-        i = start
-        while i <= end:
-            url = f"{base_url}&start={i}"
-            listURL.append(url)
-            i += 10
+        if not ensure_login(page, browser, language, logger):
+            return
 
         all_job_links = []
-        for url in listURL:
-            print(f"Visiting URL: {url}")
-            page.goto(url)
-            page.wait_for_load_state("domcontentloaded")
-            print(
-                "Waiting for page to load, if any cloudflare protection button appears... please click it.")
-            #Will be adding auto detector and resolver for this
-            time.sleep(10)
+        for url in build_search_urls(search_config):
+            all_job_links.extend(scrape_page(page, url, language, logger))
+            time.sleep(PAGE_GAP_SECONDS)
 
-            try:
-                links = collect_indeed_apply_links(page, language)
-                all_job_links.extend(links)
-                print(f"Found {len(links)} Indeed Apply jobs on this page.")
-            except Exception as e:
-                print("Error extracting jobs:", e)
-            time.sleep(5)
+        job_links = list(dict.fromkeys(all_job_links))
+        print(f"Total Indeed Apply jobs found: {len(job_links)}")
+        for job_url in job_links:
+            print(job_url)
 
-        #Deduplication
-        all_job_links = list(dict.fromkeys(all_job_links))
-        print(f"Total Unique Indeed Apply jobs found: {len(all_job_links)}")    
-        for job_url in all_job_links:
-            print(f"Applying to: {job_url}")
-            apply_to_job(browser, job_url, logger)
-            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
