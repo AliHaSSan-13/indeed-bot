@@ -23,9 +23,11 @@ import logging
 # that the app's router then swaps for a /form/<module> route.
 FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
 
+SUBMIT_BTN_SEL = '[data-testid="submit-application-button"]:visible'
+
 ACTION_BUTTON_SELECTORS = [
     '[data-testid="continue-button"]:visible',
-    '[data-testid="submit-application-button"]:visible',
+    SUBMIT_BTN_SEL,
     'button[type="submit"]:visible',
     'button:has-text("Continue"):visible',
     'button:has-text("Next"):visible',
@@ -128,6 +130,34 @@ def apply_to_job(browser, job_url, logger):
                 logger.info(f"Applied successfully to {job_url}")
                 page.close()
                 return True
+            if "review-module" in page.url:
+                #Give the Loader time to genrate the review module
+                time.sleep(10)
+                # Last step: its only CTA is "Submit your application".
+                submit_btn = page.locator(SUBMIT_BTN_SEL)
+                while True:
+                    try:
+                        submit_btn.wait_for(state="visible", timeout=15000)
+                    except PWTimeout:
+                        logger.warning(f"Submit button never appeared on review module for {job_url}")
+                        input("Press Enter to continue")
+
+                    if submit_btn.is_disabled():
+                        # Indeed keeps submission disabled until this module's CAPTCHA is solved.
+                        logger.warning(f"Captcha required, discarding {job_url}")
+                        input("Press Enter to continue after solving the captcha")
+
+                    logger.info(f"[step {step}] clicking 'Submit your application'")
+                    try:
+                        submit_btn.click(timeout=15000)
+                    except PWTimeout as e:
+                        logger.warning(f"Submit click failed for {job_url}: {str(e).splitlines()[0]}")
+                        page.close()
+                        return False
+
+                    step += 1
+                    time.sleep(2)
+                    break
 
             # Gate on the DOM, not the URL: the module must hydrate before its buttons exist.
             action_btn = find_action_button(page)
