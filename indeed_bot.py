@@ -14,6 +14,7 @@ import yaml
 import time
 import re
 import sys
+import select
 from camoufox.sync_api import Camoufox
 from playwright.sync_api import TimeoutError as PWTimeout
 import logging
@@ -24,6 +25,13 @@ import logging
 FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
 
 SUBMIT_BTN_SEL = '[data-testid="submit-application-button"]:visible'
+
+# Tail of the prompt Indeed shows when a human has to clear something (captcha,
+# unanswered screening question) before the module will advance.
+MANUAL_INPUT_RE = re.compile(r"to continue", re.IGNORECASE)
+
+# Seconds the operator gets to answer a blocking prompt before the job is discarded.
+USER_INPUT_TIMEOUT = 120
 
 ACTION_BUTTON_SELECTORS = [
     '[data-testid="continue-button"]:visible',
@@ -90,6 +98,19 @@ def find_action_button(page, timeout=20):
             return None
         time.sleep(0.5)
 
+def prompt_user(message, timeout=USER_INPUT_TIMEOUT):
+    """Wait for Enter, give up after `timeout` seconds. False if the operator went quiet."""
+    if not sys.stdin.isatty():
+        print(f"{message} (stdin is not a terminal, timeout disabled)")
+        sys.stdin.readline()
+        return True
+    print(f"{message} (Enter within {timeout}s, otherwise job is discarded) ", end="", flush=True)
+    if not select.select([sys.stdin], [], [], timeout)[0]:
+        print("\nNo response, discarding job.")
+        return False
+    sys.stdin.readline()
+    return True
+
 def apply_to_job(browser, job_url, logger):
     """Open a new tab, apply to the job using dynamic step navigation, log the result, and close the tab."""
     page = browser.new_page()
@@ -140,12 +161,17 @@ def apply_to_job(browser, job_url, logger):
                         submit_btn.wait_for(state="visible", timeout=15000)
                     except PWTimeout:
                         logger.warning(f"Submit button never appeared on review module for {job_url}")
-                        input("Press Enter to continue")
+                        if not prompt_user(f"Press Enter to continue for {job_url}: "):
+                            page.close()
+                            return False
 
                     if submit_btn.is_disabled():
                         # Indeed keeps submission disabled until this module's CAPTCHA is solved.
-                        logger.warning(f"Captcha required, discarding {job_url}")
-                        input("Press Enter to continue after solving the captcha")
+                        logger.warning(f"Captcha required for {job_url}")
+                        if not prompt_user(f"Solve the captcha then press Enter for {job_url}: "):
+                            page.close()
+                            return False
+                        continue
 
                     logger.info(f"[step {step}] clicking 'Submit your application'")
                     try:
@@ -179,6 +205,13 @@ def apply_to_job(browser, job_url, logger):
                 continue
 
             time.sleep(2)
+
+            if page.get_by_text(MANUAL_INPUT_RE).count() > 0:
+                logger.warning("Please fill the required fields manually")
+                if not prompt_user(f"Press Enter after filling the required fields for {job_url}: "):
+                    page.close()
+                    return False
+
             step += 1
 
         # Verification check after step loop finishes
