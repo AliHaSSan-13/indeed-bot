@@ -2,7 +2,7 @@
 Indeed Auto-Apply Bot
 ---------------------
 Starts the browser, verifies the login session, scrapes the Easy Apply job
-links from the configured search pages, dedupes them and prints the list.
+links from the configured search pages, then opens each one in its own tab.
 
 Usage:
   - Configure your search and Camoufox settings in config.yaml
@@ -23,7 +23,8 @@ CONFIG_PATH = "config.yaml"
 
 # How long each search page gets to settle, so a cloudflare check can be clicked.
 SEARCH_SETTLE_SECONDS = 10
-PAGE_GAP_SECONDS = 5
+# How long an opened job page rests after its document content is ready.
+JOB_PAGE_SETTLE_SECONDS = 5
 
 
 def load_config(path=CONFIG_PATH):
@@ -141,6 +142,23 @@ def scrape_page(page, url, language, logger):
     return links
 
 
+def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS):
+    """Open one job URL in a new tab of the same window and let it settle."""
+    print(f"Opening: {job_url}")
+    page = browser.new_page()
+    page.goto(job_url)
+    page.wait_for_load_state("domcontentloaded")
+    time.sleep(settle_seconds)
+    if page.title() == "Just a moment...":
+        print("Solving CAPTCHA...")
+        page.wait_for_load_state("networkidle")
+        page.mouse.click(627,215)
+        time.sleep(settle_seconds)
+        if page.title() != "Just a moment...":
+            print("CAPTCHA solved! 🎉")
+    page.close()
+
+
 def main():
     logger = setup_logger()
     config = load_config()
@@ -157,12 +175,16 @@ def main():
         all_job_links = []
         for url in build_search_urls(search_config):
             all_job_links.extend(scrape_page(page, url, language, logger))
-            time.sleep(PAGE_GAP_SECONDS)
+            time.sleep(5)
 
         job_links = list(dict.fromkeys(all_job_links))
         print(f"Total Indeed Apply jobs found: {len(job_links)}")
+
         for job_url in job_links:
-            print(job_url)
+            try:
+                open_job_page(browser, job_url)
+            except Exception as e:
+                logger.error(f"Failed to open {job_url}: {str(e).splitlines()[0]}")
 
 
 if __name__ == "__main__":
