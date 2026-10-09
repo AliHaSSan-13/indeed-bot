@@ -12,10 +12,25 @@ License: MIT
 """
 import yaml
 import time
-from datetime import datetime
-from typing import Dict, Any
+import re
+import sys
 from camoufox.sync_api import Camoufox
+from playwright.sync_api import TimeoutError as PWTimeout
 import logging
+
+
+# The smartapply entry point is an SPA: clicking Apply lands on a bootstrap URL
+# that the app's router then swaps for a /form/<module> route.
+FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
+
+ACTION_BUTTON_SELECTORS = [
+    '[data-testid="continue-button"]:visible',
+    '[data-testid="submit-application-button"]:visible',
+    'button[type="submit"]:visible',
+    'button:has-text("Continue"):visible',
+    'button:has-text("Next"):visible',
+    '[aria-label*="Continue"]:visible',
+]
 
 
 with open("config.yaml", "r") as f:
@@ -51,11 +66,9 @@ def collect_indeed_apply_links(page, language):
                 # Resolve relative URLs
                 if job_url.startswith('/'):
                     job_url = f"https://{language}.indeed.com{job_url}"
-                    print(job_url)
                 links.append(job_url)
                 
     return links
-
 
 def click_and_wait(element, timeout=5):
     if element:
@@ -63,130 +76,103 @@ def click_and_wait(element, timeout=5):
         time.sleep(timeout)
 
 
-def apply_to_job(browser, job_url, language, logger):
-    """Open a new tab, apply to the job, log the result, and close the tab."""
+def find_action_button(page, timeout=20):
+    """Poll the CTA selector chain until a visible match appears; return it or None."""
+    deadline = time.time() + timeout
+    while True:
+        for selector in ACTION_BUTTON_SELECTORS:
+            candidate = page.locator(selector)
+            if candidate.count() > 0 and candidate.first.is_visible():
+                return candidate.first
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+def apply_to_job(browser, job_url, logger):
+    """Open a new tab, apply to the job using dynamic step navigation, log the result, and close the tab."""
     page = browser.new_page()
+    page.set_default_timeout(15000)
+
     try:
-        page.goto(job_url)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(3)
-        # Try to find the apply button using robust, language-agnostic selectors
-        apply_btn = None
-        for _ in range(20):
-            # 1. Try button with a span with the unique Indeed Apply class (often css-1ebo7dz)
-            apply_btn = page.query_selector(
-                'button:has(span[class*="css-1ebo7dz"])')
-            # 2. Fallback: first visible button with a span containing "Postuler" or "Apply"
-            if not apply_btn:
-                apply_btn = page.query_selector(
-                    'button:visible:has-text("Postuler")')
-            if not apply_btn:
-                apply_btn = page.query_selector(
-                    'button:visible:has-text("Apply")')
-            # 3. Fallback: first visible button on the page (avoid close/cancel if possible)
-            if not apply_btn:
-                btns = page.query_selector_all('button:visible')
-                for btn in btns:
-                    label = (btn.get_attribute("aria-label") or "").lower()
-                    text = (btn.inner_text() or "").lower()
-                    if "close" in label or "cancel" in label or "fermer" in label or "annuler" in label:
-                        continue
-                    if "postuler" in text or "apply" in text or btn.is_visible():
-                        apply_btn = btn
-                        break
-            if apply_btn:
-                break
-            time.sleep(0.5)
-        if apply_btn:
-            click_and_wait(apply_btn, 5)
-        else:
-            logger.warning(
-                f"No Indeed Apply button found for {job_url}")
-            page.close()
-            return False
+        page.goto(job_url, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(5)
 
-        # add timeout for the wizard loop
-        start_time = time.time()
-        while True:
-            if time.time() - start_time > 40:
-                logger.warning(
-                    f"Timeout applying to {job_url}, closing tab and moving to next.")
-                break
-            current_url = page.url
-            # Resume step: select resume card if present
-            resume_card = page.query_selector(
-                '[data-testid="FileResumeCardHeader-title"]')
-            if resume_card:
-                # Click the resume card (or its parent if needed)
-                try:
-                    resume_card.click()
-                except Exception:
-                    parent = resume_card.evaluate_handle(
-                        'node => node.parentElement')
-                    if parent:
-                        parent.click()
-                time.sleep(1)
-                continuer_btn = None
-                btns = page.query_selector_all('button:visible')
-                for btn in btns:
-                    text = (btn.inner_text() or "").lower()
-                    if "continuer" in text or "continue" in text:
-                        continuer_btn = btn
-                        break
-                if continuer_btn:
-                    click_and_wait(continuer_btn, 3)
-                    continue  # go to next step
+        # 1. Click the primary "Apply Now" / "Easily Apply" button on the job page
+        apply_btn_xpath = "/html/body/div[1]/div[2]/div/div/div/div[2]/div/div/div/div/div/div/div/div[2]/div[4]/div[1]/div"
+        apply_btn = page.query_selector(f"xpath={apply_btn_xpath}")
+        if apply_btn is None:
+            apply_btn = page.locator(
+                'a:has-text("Apply now"), button:has-text("Apply now"), '
+                'a:has-text("Easily apply"), [data-testid*="apply"]'
+            ).first
+            apply_btn.wait_for(state="visible", timeout=15000)
+        apply_btn.click(timeout=15000)
 
-            # try to find a submit button ( dynamic text) idk if it's working
-            submit_btn = None
-            btns = page.query_selector_all('button:visible')
-            for btn in btns:
-                text = (btn.inner_text() or "").lower()
-                if (
-                    "déposer ma candidature" in text or
-                    "soumettre" in text or
-                    "submit" in text or
-                    "apply" in text or
-                    "bewerben" in text or  # German
-                    "postular" in text     # Spanish
-                ):
-                    submit_btn = btn
-                    break
-            # fallback: last visible button (often the submit)
-            if not submit_btn and btns:
-                submit_btn = btns[-1]
-            if submit_btn:
-                click_and_wait(submit_btn, 3)
+        # 2. Wait for the smartapply SPA to swap its bootstrap URL for a /form/ route.
+        #    wait_for_load_state() does not fire on client-side routing, so the URL
+        #    must be waited on explicitly instead of sleeping a fixed amount.
+        try:
+            page.wait_for_url(FORM_URL_RE, timeout=45000)
+        except PWTimeout:
+            logger.warning(f"Never reached smartapply form, stalled at {page.url}")
+
+        # 3. Multi-step form loop (handles smartapply pages)
+        max_steps = 10
+        step = 0
+
+        while step < max_steps:
+            logger.info(f"[step {step}] {page.url}")
+
+            # Check for successful completion
+            if "post-apply" in page.url:
                 logger.info(f"Applied successfully to {job_url}")
+                page.close()
+                return True
+
+            # Gate on the DOM, not the URL: the module must hydrate before its buttons exist.
+            action_btn = find_action_button(page)
+            if action_btn is None:
+                logger.warning(f"Could not find action button at step {step} for {job_url}")
                 break
 
-            # fallback: try to find a visible and enabled button to continue (other stesp)
-            btn = page.query_selector(
-                'button[type="button"]:not([aria-disabled="true"]), button[type="submit"]:not([aria-disabled="true"])')
-            if btn:
-                click_and_wait(btn, 3)
-                if "confirmation" in page.url or "submitted" in page.url:
-                    logger.info(f"Applied successfully to {job_url}")
-                    break
-            else:
-                logger.warning(
-                    f"No continue/submit button found at {current_url}")
+            # Indeed keeps the CTA disabled until every required field is filled.
+            if action_btn.is_disabled():
+                logger.warning(f"Form incomplete at step {step}, action button disabled, for {job_url}")
                 break
-        page.close()
-        return True
-    except Exception as e:
-        logger.error(f"Error applying to {job_url}: {e}")
+
+            logger.info(f"[step {step}] clicking {action_btn.inner_text().strip()[:30]!r}")
+            try:
+                action_btn.click(timeout=15000)
+            except PWTimeout as e:
+                logger.warning(f"Click failed at step {step} for {job_url}: {str(e).splitlines()[0]}")
+                step += 1
+                continue
+
+            time.sleep(2)
+            step += 1
+
+        # Verification check after step loop finishes
+        if "post-apply" in page.url:
+            logger.info(f"Applied successfully to {job_url}")
+            page.close()
+            return True
+
+        logger.warning(f"Failed to apply to {job_url}")
         page.close()
         return False
 
+    except Exception as e:
+        logger.exception(f"Error applying to {job_url}: {e}")
+        page.close()
+        return False
 
 def setup_logger():
     logger = logging.getLogger("indeed_apply")
     logger.setLevel(logging.INFO)
-    fh = logging.FileHandler("indeed_apply.log")
-    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    logger.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+    logger.addHandler(handler)
     return logger
 
 
@@ -232,6 +218,7 @@ with Camoufox(user_data_dir=user_data_dir,
             page.wait_for_load_state("domcontentloaded")
             print(
                 "Waiting for page to load, if any cloudflare protection button appears... please click it.")
+            #Will be adding auto detector and resolver for this
             time.sleep(10)
 
             try:
@@ -242,31 +229,10 @@ with Camoufox(user_data_dir=user_data_dir,
                 print("Error extracting jobs:", e)
             time.sleep(5)
 
-        print(f"Total Indeed Apply jobs found: {len(all_job_links)}")
+        #Deduplication
+        all_job_links = list(dict.fromkeys(all_job_links))
+        print(f"Total Unique Indeed Apply jobs found: {len(all_job_links)}")    
         for job_url in all_job_links:
             print(f"Applying to: {job_url}")
-            success = apply_to_job(browser, job_url, language, logger)
-            if not success:
-                logger.error(f"Failed to apply to {job_url}")
-            time.sleep(5)
-        all_job_links = []
-        for url in listURL:
-            print(f"Visiting URL: {url}")
-            page.goto(url)
-            page.wait_for_load_state("domcontentloaded")
-            time.sleep(7)
-            try:
-                links = collect_indeed_apply_links(page, language)
-                all_job_links.extend(links)
-                print(f"Found {len(links)} Indeed Apply jobs on this page.")
-            except Exception as e:
-                print("Error extracting jobs:", e)
-            time.sleep(5)
-
-        print(f"Total Indeed Apply jobs found: {len(all_job_links)}")
-        for job_url in all_job_links:
-            print(f"Applying to: {job_url}")
-            success = apply_to_job(browser, job_url, language, logger)
-            if not success:
-                logger.error(f"Failed to apply to {job_url}")
+            apply_to_job(browser, job_url, logger)
             time.sleep(5)
