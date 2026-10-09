@@ -2,7 +2,8 @@
 Indeed Auto-Apply Bot
 ---------------------
 Starts the browser, verifies the login session, scrapes the Easy Apply job
-links from the configured search pages, then opens each one in its own tab.
+links from the configured search pages, then opens each one in its own tab and
+clicks its Apply now button.
 
 Usage:
   - Configure your search and Camoufox settings in config.yaml
@@ -12,11 +13,13 @@ Author: @meteor314
 License: MIT
 """
 import logging
+import re
 import sys
 import time
 
 import yaml
 from camoufox.sync_api import Camoufox
+from playwright.sync_api import TimeoutError as PWTimeout
 
 
 CONFIG_PATH = "config.yaml"
@@ -25,6 +28,18 @@ CONFIG_PATH = "config.yaml"
 SEARCH_SETTLE_SECONDS = 10
 # How long an opened job page rests after its document content is ready.
 JOB_PAGE_SETTLE_SECONDS = 5
+
+# Primary Apply button on a job page, with a text/testid fallback below it.
+APPLY_BTN_XPATH = "/html/body/div[1]/div[2]/div/div/div/div[2]/div/div/div/div/div/div/div/div[2]/div[4]/div[1]/div"
+APPLY_BTN_SELECTOR = (
+    'a:has-text("Apply now"), button:has-text("Apply now"), '
+    'a:has-text("Easily apply"), [data-testid*="apply"]'
+)
+
+# Clicking Apply lands on a bootstrap URL that smartapply's router then swaps for
+# a /form/<module> route, so the landing has to be waited on by URL - the SPA
+# route change fires no load event for wait_for_load_state() to see.
+FORM_URL_RE = re.compile(r"smartapply\.indeed\.com/beta/indeedapply/form/")
 
 
 def load_config(path=CONFIG_PATH):
@@ -142,6 +157,18 @@ def scrape_page(page, url, language, logger):
     return links
 
 
+def click_apply_now(page):
+    """Click the primary Apply now button on an open job page."""
+    apply_btn = page.query_selector(f"xpath={APPLY_BTN_XPATH}")
+    if apply_btn is None:
+        apply_btn = page.locator(APPLY_BTN_SELECTOR).first
+
+    label = apply_btn.inner_text().strip()[:30]
+    apply_btn.click(timeout=15000)
+    print(f"Clicked {label!r}")
+    return label
+
+
 def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS):
     """Open one job URL in a new tab of the same window and let it settle."""
     print(f"Opening: {job_url}")
@@ -156,6 +183,18 @@ def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS):
         time.sleep(settle_seconds)
         if page.title() != "Just a moment...":
             print("CAPTCHA solved! 🎉")
+        else:
+            print("CAPTCHA not solved, Discarding job...")
+            page.close()
+            return
+
+    try:
+        click_apply_now(page)
+        page.wait_for_url(FORM_URL_RE, timeout=45000)
+        print(f"Now applying at: {page.url}")
+        input("Press Enter to close the browser - After applying")
+    except PWTimeout:
+        print(f"Apply did not reach the smartapply form, stalled at: {page.url}")
     page.close()
 
 
