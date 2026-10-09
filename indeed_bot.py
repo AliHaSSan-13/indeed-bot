@@ -26,19 +26,34 @@ language = camoufox_config.get("language")
 
 
 def collect_indeed_apply_links(page, language):
-    """Collect all 'Indeed Apply' job links from the current search result page."""
+    """
+    Collect all 'Easily apply' job links from the current Indeed search result page.
+    """
     links = []
-    job_cards = page.query_selector_all('div[data-testid="slider_item"]')
+    
+    # Target result containers directly (handles tr/td or card wrappers)
+    job_cards = page.query_selector_all('td.resultContent, div.job_seen_beacon')
+    
     for card in job_cards:
-        indeed_apply = card.query_selector('[data-testid="indeedApply"]')
-        if indeed_apply:
-            link = card.query_selector('a.jcs-JobTitle')
-            if link:
-                job_url = link.get_attribute('href')
-                if job_url:
-                    if job_url.startswith('/'):
-                        job_url = f"https://{language}.indeed.com{job_url}"
-                    links.append(job_url)
+        # Check for the "Easily apply" text badge or the data-testid attribute
+        easy_apply_badge = card.query_selector('[data-testid="indeedApply"]')
+        has_easy_apply_text = "Easily apply" in card.inner_text()
+
+        # Skip jobs that are not "Easy Apply"
+        if not (easy_apply_badge or has_easy_apply_text):
+            continue
+
+        # Target the job link
+        link = card.query_selector('a.jcs-JobTitle')
+        if link:
+            job_url = link.get_attribute('href')
+            if job_url:
+                # Resolve relative URLs
+                if job_url.startswith('/'):
+                    job_url = f"https://{language}.indeed.com{job_url}"
+                    print(job_url)
+                links.append(job_url)
+                
     return links
 
 
