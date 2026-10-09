@@ -185,12 +185,17 @@ with Camoufox(user_data_dir=user_data_dir,
     ppid_cookie = next(
         (cookie for cookie in cookies if cookie['name'] == 'PPID'), None)
     if not ppid_cookie:
-        print("Token not found, please log in to Indeed first.")
-        print("Redirecting to login page...")
-        print("You need  to restart the bot after logging in.")
-        page.goto(
-            "https://secure.indeed.com/auth?hl=" + language)
-        time.sleep(1000)  # wait for manual login
+        try:
+            print("Token not found, please log in to Indeed first.")
+            print("Redirecting to login page...")
+            print("You need  to restart the bot after logging in.")
+            page.goto("https://secure.indeed.com/auth?hl=" + language)
+            input("Press Enter to close the browser - After logging in")
+            print("Closing browser")
+            browser.close()
+        except Exception as e:
+            print("Error logging in ,Please try again")
+            print(e)
     else:
         print("Token found, proceeding with job search...")
         search_config = config.get("search", {})
