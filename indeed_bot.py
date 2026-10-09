@@ -21,6 +21,8 @@ import yaml
 from camoufox.sync_api import Camoufox
 from playwright.sync_api import TimeoutError as PWTimeout
 
+from ai_evaluation import filter_jobs
+
 
 CONFIG_PATH = "config.yaml"
 
@@ -68,7 +70,6 @@ ACTION_BUTTON_SELECTORS = [
     'button:has-text("Continue"):visible',
     'button:has-text("Next"):visible',
     '[aria-label*="Continue"]:visible',
-    'button:visible',
 ]
 
 
@@ -146,9 +147,10 @@ def build_search_urls(search_config):
 
 def collect_indeed_apply_links(page, language = "www"):
     """
-    Collect all 'Easily apply' job links from the current Indeed search result page.
+    Collect all 'Easily apply' jobs from the current Indeed search result page
+    as (title, url) pairs.
     """
-    links = []
+    jobs = []
     
     # Target result containers directly (handles tr/td or card wrappers)
     job_cards = page.query_selector_all('td.resultContent, div.job_seen_beacon')
@@ -170,13 +172,30 @@ def collect_indeed_apply_links(page, language = "www"):
                 # Resolve relative URLs
                 if job_url.startswith('/'):
                     job_url = f"https://{language}.indeed.com{job_url}"
-                links.append(job_url)
+                jobs.append((extract_job_title(link), job_url))
                 
-    return links
+    return jobs
+
+
+def extract_job_title(link):
+    """Job title from a jcs-JobTitle anchor. The aria-label carries a
+    'full details of ' prefix, so the titled span is preferred."""
+    span = link.query_selector('span[title]')
+    if span:
+        title = span.get_attribute('title')
+        if title:
+            return title.strip()
+
+    title = link.inner_text().strip()
+    if title:
+        return title
+
+    label = link.get_attribute('aria-label') or ""
+    return label.removeprefix('full details of ').strip()
 
 
 def scrape_page(page, url, language, logger):
-    """Load one search results page and return its Easy Apply job links."""
+    """Load one search results page and return its Easy Apply jobs as (title, url) pairs."""
     print(f"Visiting URL: {url}")
     page.goto(url)
     page.wait_for_load_state("domcontentloaded")
@@ -186,13 +205,13 @@ def scrape_page(page, url, language, logger):
     time.sleep(SEARCH_SETTLE_SECONDS)
 
     try:
-        links = collect_indeed_apply_links(page, language)
+        jobs = collect_indeed_apply_links(page, language)
     except Exception as e:
         logger.error(f"Error extracting jobs from {url}: {e}")
-        links = []
+        jobs = []
 
-    print(f"Found {len(links)} Indeed Apply jobs on this page.")
-    return links
+    print(f"Found {len(jobs)} Indeed Apply jobs on this page.")
+    return jobs
 
 
 def click_apply_now(page):
@@ -244,7 +263,7 @@ def submit_review_module(page, job_url):
 
     if submit_btn.first.is_disabled():
         print(f"Submit still disabled after CAPTCHA, discarding {job_url}")
-        return False
+        input("Press Enter to continue after filling CAPTCHA: ")
 
     print("Clicking 'Submit your application'")
     try:
@@ -284,7 +303,8 @@ def submit_application(page, job_url, max_steps=10):
 
         if action_btn.is_disabled():
             print(f"Form incomplete at step {step}, action button disabled, for {job_url}")
-            return False
+            input("Press Enter to continue after filling the required fields: ")
+            continue
 
         print(f"[step {step}] clicking {action_btn.inner_text().strip()[:30]!r}")
         try:
@@ -350,6 +370,7 @@ def main():
     config = load_config()
     camoufox_config = config.get("camoufox", {})
     search_config = config.get("search", {})
+    ai_config = config.get("ai", {})
     language = camoufox_config.get("language")
 
     with start_browser(camoufox_config) as browser:
@@ -359,19 +380,24 @@ def main():
         if not ensure_login(page, browser, language, logger):
             return
 
-        all_job_links = []
+        all_jobs = []
         for url in build_search_urls(search_config):
-            all_job_links.extend(scrape_page(page, url, language, logger))
+            all_jobs.extend(scrape_page(page, url, language, logger))
             time.sleep(5)
 
-        job_links = list(dict.fromkeys(all_job_links))
-        print(f"Total Indeed Apply jobs found: {len(job_links)}")
+        jobs = list(dict.fromkeys(all_jobs))
+        print(f"Total Indeed Apply jobs found: {len(jobs)}")
 
-        for job_url in job_links:
+        selected_jobs = filter_jobs(jobs, ai_config, logger)
+        print(f"Jobs selected for applying: {len(selected_jobs)}")
+        for title, job_url in selected_jobs:
+            print(f"Applying to: {title} -> {job_url}")
+
+        for title, job_url in selected_jobs:
             try:
                 open_job_page(browser, job_url, language=language)
             except Exception as e:
-                logger.error(f"Failed to open {job_url}: {str(e).splitlines()[0]}")
+                logger.error(f"Failed to apply to '{title}': {str(e).splitlines()[0]}")
 
 
 if __name__ == "__main__":
