@@ -1,9 +1,9 @@
 """
 Indeed Auto-Apply Bot
 ---------------------
-Starts the browser, verifies the login session, scrapes the Easy Apply job
-links from the configured search pages, then opens each one in its own tab and
-clicks its Apply now button.
+Starts the browser, verifies the login session, scrapes the Easy Apply jobs
+from the configured search pages, filters them through the AI gate, then opens
+each selected job in its own tab and drives its application to submission.
 
 Usage:
   - Configure your search and Camoufox settings in config.yaml
@@ -21,13 +21,15 @@ import yaml
 from camoufox.sync_api import Camoufox
 from playwright.sync_api import TimeoutError as PWTimeout
 
-from ai_evaluation import filter_jobs
+from ai_evaluation import ai_enabled, filter_jobs
 
 
 CONFIG_PATH = "config.yaml"
 
 # How long each search page gets to settle, so a cloudflare check can be clicked.
 SEARCH_SETTLE_SECONDS = 10
+# Gap between consecutive search pages.
+PAGE_GAP_SECONDS = 5
 # How long an opened job page rests after its document content is ready.
 JOB_PAGE_SETTLE_SECONDS = 5
 
@@ -226,10 +228,7 @@ def click_apply_now(page):
     if apply_btn is None:
         apply_btn = page.locator(APPLY_BTN_SELECTOR).first
 
-    label = apply_btn.inner_text().strip()[:30]
     apply_btn.click(timeout=15000)
-    print(f"Clicked {label!r}")
-    return label
 
 
 def find_action_button(page, timeout=20):
@@ -261,9 +260,14 @@ def submit_review_module(page, job_url):
         print(f"Submit button never appeared for {job_url}")
         return False
 
-    if submit_btn.first.is_disabled():
-        print(f"Submit still disabled after CAPTCHA, discarding {job_url}")
-        input("Press Enter to continue after filling CAPTCHA: ")
+    # Re-check after every prompt: clicking a still-disabled button just burns the
+    # click timeout and fails the job.
+    while submit_btn.first.is_disabled():
+        print(f"Submit still disabled for {job_url}")
+        answer = input("Press Enter to continue after solving the captcha: ")
+        if answer.lower() == "n":
+            print("Discarding job...")
+            return False
 
     print("Clicking 'Submit your application'")
     try:
@@ -303,7 +307,13 @@ def submit_application(page, job_url, max_steps=10):
 
         if action_btn.is_disabled():
             print(f"Form incomplete at step {step}, action button disabled, for {job_url}")
-            input("Press Enter to continue after filling the required fields: ")
+            answer = input("Press Enter to continue after filling the required fields: ")
+            if answer.lower() == "n":
+                print("Discarding job...")
+                return False
+            # Without this the loop re-enters this branch forever and max_steps is
+            # never reached.
+            step += 1
             continue
 
         print(f"[step {step}] clicking {action_btn.inner_text().strip()[:30]!r}")
@@ -318,7 +328,10 @@ def submit_application(page, job_url, max_steps=10):
 
         if page.get_by_text(MANUAL_INPUT_RE).count() > 0:
             print("Please fill the required fields manually")
-            input("Press Enter to continue after filling the required fields: ")
+            answer = input("Press Enter to continue after filling the required fields: ")
+            if answer.lower() == "n":
+                print("Discarding job...")
+                return False
 
         step += 1
 
@@ -331,39 +344,36 @@ def submit_application(page, job_url, max_steps=10):
 
 
 def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS, language="www"):
-    """Open one job URL in a new tab of the same window and let it settle."""
-    
+    """Open one job URL in a new tab of the same window and apply to it."""
     page = browser.new_page()
-    # Always start at the Indeed homepage, so we dont get 429 errors.
-    #page.goto(f"https://{language}.indeed.com")
-    #time.sleep(settle_seconds)
 
     print(f"Opening: {job_url}")
-    page.goto(job_url)
-    page.wait_for_load_state("domcontentloaded")
-    time.sleep(settle_seconds)
-    # Check if we hit CAPTCHA
-    if page.title() == "Just a moment...":
-        print("Solving CAPTCHA...")
-        page.wait_for_load_state("networkidle")
-        page.mouse.click(627,215)
-        time.sleep(settle_seconds)
-        if page.title() != "Just a moment...":
-            print("CAPTCHA solved! 🎉")
-        else:
-            print("CAPTCHA not solved, Discarding job...")
-            page.close()
-            return
-
     try:
+        page.goto(job_url)
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(settle_seconds)
+
+        # Check if we hit CAPTCHA
+        if page.title() == "Just a moment...":
+            print("Solving CAPTCHA...")
+            page.wait_for_load_state("networkidle")
+            page.mouse.click(627, 215)
+            time.sleep(settle_seconds)
+            if page.title() == "Just a moment...":
+                print("CAPTCHA not solved, Discarding job...")
+                return False
+
+            print("CAPTCHA solved! 🎉")
+
         click_apply_now(page)
         page.wait_for_url(FORM_URL_RE, timeout=45000)
         print(f"Now applying at: {page.url}")
-        submit_application(page, job_url)
-        input("Press Enter to close the browser - After applying")
+        return submit_application(page, job_url)
     except PWTimeout:
         print(f"Apply did not reach the smartapply form, stalled at: {page.url}")
-    page.close()
+        return False
+    finally:
+        page.close()
 
 
 def main():
@@ -377,7 +387,9 @@ def main():
     with start_browser(camoufox_config) as browser:
         # Block flagging requests
         block_tracking(browser)
-        page = browser.new_page()
+        # Camoufox opens an about:blank page on launch - reuse it instead of
+        # stacking a second one on top.
+        page = browser.pages[0] if browser.pages else browser.new_page()
 
         # Check for user profile
         if not ensure_login(page, browser, language, logger):
@@ -387,28 +399,35 @@ def main():
         # Build all URLs and Scrape jobs
         for url in build_search_urls(search_config):
             all_jobs.extend(scrape_page(page, url, language, logger))
-            time.sleep(JOB_PAGE_SETTLE_SECONDS)
+            time.sleep(PAGE_GAP_SECONDS)
 
         # Dedup the jobs
         jobs = list(dict.fromkeys(all_jobs))
         print(f"Total Indeed Apply jobs found: {len(jobs)}")
 
-        if ai_config.get("enabled"):
+        if ai_enabled(ai_config):
             print("AI Evaluation enabled......Evaluating")
             selected_jobs = filter_jobs(jobs, ai_config, logger)
         else:
             selected_jobs = jobs
 
-
         print(f"Jobs selected for applying: {len(selected_jobs)}")
 
+        applied = 0
+        failed = 0
         for title, job_url in selected_jobs:
+            print(f"Applying to: {title} -> {job_url}")
             try:
-                print(f"Applying to: {title} -> {job_url}")
                 # Applying to Job
-                open_job_page(browser, job_url, language=language)
+                if open_job_page(browser, job_url, language=language):
+                    applied += 1
+                else:
+                    failed += 1
             except Exception as e:
+                failed += 1
                 logger.error(f"Failed to apply to '{title}': {str(e).splitlines()[0]}")
+
+        print(f"Done. Applied: {applied}, failed/skipped: {failed}, of {len(selected_jobs)} selected.")
 
 
 if __name__ == "__main__":
