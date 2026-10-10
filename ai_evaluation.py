@@ -8,7 +8,7 @@ else - including a failed or malformed reply - rejects it.
 Config lives under the `ai:` section of config.yaml.
 """
 import re
-
+import time
 import requests
 
 
@@ -79,6 +79,7 @@ def is_worth_applying(job_title, ai_config, logger):
         return False
 
     logger.info(f"AI accepted '{job_title}'")
+    time.sleep(2)
     return True
 
 

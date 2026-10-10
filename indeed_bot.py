@@ -9,7 +9,7 @@ Usage:
   - Configure your search and Camoufox settings in config.yaml
   - Run: python indeed_bot.py
 
-Author: @meteor314 
+Author: @Ali HaSSan-13
 License: MIT
 """
 import logging
@@ -100,8 +100,7 @@ def start_browser(camoufox_config):
 
 
 def block_tracking(browser):
-    """Abort tracking/logging requests. Set on the context so every new tab is covered."""
-    # Camoufox yields a BrowserContext when persistent_context=True, else a Browser.
+    """Abort tracking/logging requests. So we dont get `429` from Indeed"""
     context = getattr(browser, "context", browser)
     for pattern in BLOCKED_ROUTES:
         context.route(pattern, lambda route: route.abort())
@@ -135,7 +134,7 @@ def build_search_urls(search_config):
     """One results URL per page between start and end, 10 jobs apart."""
     base_url = search_config.get("base_url", "")
     start = int(search_config.get("start", 0))
-    end = int(search_config.get("end", 0))
+    end = int(search_config.get("end", 1))
 
     urls = []
     offset = start
@@ -201,7 +200,7 @@ def scrape_page(page, url, language, logger):
     page.wait_for_load_state("domcontentloaded")
     print(
         "Waiting for page to load, if any cloudflare protection button appears... please click it.")
-    #Will be adding auto detector and resolver for this
+    #----------Will be adding auto detector and resolver for this
     time.sleep(SEARCH_SETTLE_SECONDS)
 
     try:
@@ -216,12 +215,13 @@ def scrape_page(page, url, language, logger):
 
 def click_apply_now(page):
     """Click the primary Apply now button on an open job page."""
+    # Checking For Captcha
     if page.title() == "Just a moment...":
         print("Solving CAPTCHA...")
         page.wait_for_load_state("networkidle")
         page.mouse.click(627,215)
         print("CAPTCHA solved! 🎉")
-        time.sleep(5)
+        time.sleep(JOB_PAGE_SETTLE_SECONDS)
     apply_btn = page.query_selector(f"xpath={APPLY_BTN_XPATH}")
     if apply_btn is None:
         apply_btn = page.locator(APPLY_BTN_SELECTOR).first
@@ -247,12 +247,12 @@ def find_action_button(page, timeout=20):
 
 def submit_review_module(page, job_url):
     """Clear the captcha if present, submit, and confirm via the landing URL."""
-    time.sleep(10)
+    time.sleep(SEARCH_SETTLE_SECONDS)
     # Scrool to the bottom of the page to find the CAPTCHA checkbox.
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     page.mouse.click(589,2688)
     print("Clicking CAPTCHA checkbox")
-    time.sleep(2)
+    time.sleep(JOB_PAGE_SETTLE_SECONDS)
 
     submit_btn = page.locator(SUBMIT_BTN_SELECTOR)
     try:
@@ -335,13 +335,14 @@ def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS, lang
     
     page = browser.new_page()
     # Always start at the Indeed homepage, so we dont get 429 errors.
-    page.goto(f"https://{language}.indeed.com")
-    time.sleep(settle_seconds)
+    #page.goto(f"https://{language}.indeed.com")
+    #time.sleep(settle_seconds)
 
     print(f"Opening: {job_url}")
     page.goto(job_url)
     page.wait_for_load_state("domcontentloaded")
     time.sleep(settle_seconds)
+    # Check if we hit CAPTCHA
     if page.title() == "Just a moment...":
         print("Solving CAPTCHA...")
         page.wait_for_load_state("networkidle")
@@ -374,27 +375,37 @@ def main():
     language = camoufox_config.get("language")
 
     with start_browser(camoufox_config) as browser:
+        # Block flagging requests
         block_tracking(browser)
         page = browser.new_page()
 
+        # Check for user profile
         if not ensure_login(page, browser, language, logger):
             return
 
         all_jobs = []
+        # Build all URLs and Scrape jobs
         for url in build_search_urls(search_config):
             all_jobs.extend(scrape_page(page, url, language, logger))
-            time.sleep(5)
+            time.sleep(JOB_PAGE_SETTLE_SECONDS)
 
+        # Dedup the jobs
         jobs = list(dict.fromkeys(all_jobs))
         print(f"Total Indeed Apply jobs found: {len(jobs)}")
 
-        selected_jobs = filter_jobs(jobs, ai_config, logger)
+        if ai_config.get("enabled"):
+            print("AI Evaluation enabled......Evaluating")
+            selected_jobs = filter_jobs(jobs, ai_config, logger)
+        else:
+            selected_jobs = jobs
+
+
         print(f"Jobs selected for applying: {len(selected_jobs)}")
-        for title, job_url in selected_jobs:
-            print(f"Applying to: {title} -> {job_url}")
 
         for title, job_url in selected_jobs:
             try:
+                print(f"Applying to: {title} -> {job_url}")
+                # Applying to Job
                 open_job_page(browser, job_url, language=language)
             except Exception as e:
                 logger.error(f"Failed to apply to '{title}': {str(e).splitlines()[0]}")
