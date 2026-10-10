@@ -3,10 +3,10 @@
 
 
 search:
-  base_url: "https://pk.indeed.com/jobs?q=python&l=&vjk=71e1904eba340144"
+  base_url: "https://pk.indeed.com/jobs?q=back+end+developer&l=Lahore&vjk=c834481100404e35"
 
-  start: 1
-  end: 2 # default is 100, you can set it to 1000 or more for larger searches (not recommanded though)
+  start: 2
+  end: 3 # default is 100, you can set it to 1000 or more for larger searches (not recommanded though)
 
 camoufox:
   user_data_dir: "user_data_dir"
@@ -22,9 +22,10 @@ ai:
   api_key: "sk-your-key"
   timeout: 20
   user_profile_prompt: |
-    I am a Python backend developer with 3 years of experience with FastAPI,
-    Django and PostgreSQL. Looking for full-time backend roles, remote or
-    based in Pakistan, paying at least Rs 150,000 per month.
+    I am a Python backend developer with hands-on experience in FastAPI,
+    Django, Flask, PostgreSQL, Redis, and Docker. Experienced in building microservices,
+    web scraping pipelines, and AI/automation integrations. Looking for full-time backend,
+    software engineering, or automation roles.
 
 
 

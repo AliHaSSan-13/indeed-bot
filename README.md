@@ -7,106 +7,157 @@ This guide explains how to use this bot. Use at your own risk. Indeed may change
 
 ## Features
 
-- Automatically finds and applies to jobs on Indeed with "Indeed Apply" .
-- Uses Camoufox for browser automation (bypass Cloudfare, Captch bot)
-- Handles multi-step application forms, including resume upload and personal info.
+- Scrapes "Indeed Apply" jobs from your Indeed search results.
+- Optional AI gate: an OpenAI-compatible endpoint filters job titles against your profile before anything is applied to.
+- Uses [Camoufox](https://github.com/daijro/camoufox) for browser automation (fingerprint spoofing, Cloudflare handling).
+- Walks the smartapply wizard: picks a resume, clicks Continue, handles captchas, and submits.
+- Logs to the terminal only — no log files.
 
 ## Prerequisites
 
-- Python 3.8+
-- [Camoufox](https://github.com/meteor314/camoufox) installed and configured
+- **Python 3.10 – 3.13** (Camoufox 0.5.5 declares `>=3.10,<4.0`)
+- Linux, macOS, or Windows (see [Platform support](#platform-support))
 - An Indeed account with:
   - Your CV already uploaded
-  - Your name, address, and phone number filled in your Indeed profile
+  - Your name, address, and phone number filled in your Indeed profile (It is better to have your Profile Completed)
+- Optional, for the AI gate: any OpenAI-compatible chat-completions endpoint
 
 ---
 
 ## Setup
 
-1. **Clone this repository** and install dependencies:
+1. **Clone and install:**
     ```bash
+    git clone <your-repo-url>
+    cd indeed_bot
+    python -m venv .venv
+    source .venv/bin/activate        # Windows: .venv\Scripts\activate
     pip install -r requirements.txt
     ```
 
-2. **Edit `config.yaml`:**
+2. **Edit `config.yaml`.** Copy `config.example.yaml` if you are setting this up fresh.
 
-    Example:
     ```yaml
-    camoufox:
-      user_data_dir: "user_data_dir" # by default, no need to change this value
-      language: "fr"  # or "uk", "de", etc. make sure to update this value
-
     search:
-      base_url: "https://fr.indeed.com/jobs?q=python+developer&l=Paris"
+      base_url: "https://uk.indeed.com/jobs?q=python+developer&l=London"
       start: 0
-      end: 100
+      end: 50        # pagination offset; must be a multiple of 10
+
+    camoufox:
+      user_data_dir: "user_data_dir"   # where the Indeed session is stored
+      language: "uk"                   # Indeed site code
+
+    ai:
+      enabled: false                   # turn on to filter jobs before applying
+      base_url: "http://localhost:8081/v1"
+      model: "gemini-3.5-flash"
+      api_key: "sk-your-key"
+      timeout: 20
+      user_profile_prompt: |
+        I am a Python backend developer with experience in FastAPI and Django...
     ```
 
-    - `user_data_dir`: Path to your Chrome user data directory (to keep your Indeed session).
-    - `language`: Your Indeed site language code (e.g., "fr" for France, "uk" for United Kingdom) etc..
-    - `base_url`: The Indeed search URL for your job search.
-    - `start`/`end`: Pagination range (should be multiples of 10).
+    - `base_url` — an Indeed search URL.
+    - `start`/`end` — result offsets, 10 apart. `end: 3` fetches only the first page; use `end: 100` for a broad sweep.
+    - `language` — Indeed site code, must match `base_url` (`uk`, `us`, `fr`, `de`, `pk`, `in`, …).
+    - `user_profile_prompt` — leave empty to disable the AI gate entirely, even if `enabled` is true.
 
-3. **How to get your `base_url`:**
+3. **Get your `base_url`:**
 
     - Go to [Indeed](https://www.indeed.com/) in your browser.
-    - Select your search options (job title, location, remote working, type of work, etc.).
-    - Click on **Find jobs**.
-    - Copy the URL from your browser's address bar.
-    - Paste this URL as the value for `base_url` in your `config.yaml`.
+    - Set your search options (title, location, remote, job type).
+    - Click **Find jobs** and copy the URL from the address bar.
 
     ![How to get your base_url](assets/Readme.png)
 
-4. **Upload your CV to Indeed:**
-    - Go to your Indeed profile and upload your CV.
-    - Make sure your name, address, and phone number are filled in. 
-    - This bot will use this information to apply for jobs. So make sure they are filled in correctly otherwise the bot will not be able to apply for jobs.
+4. **Fill in your Indeed profile** — upload your CV and confirm your name, address and phone are filled in. The bot relies on the profile to complete applications.
 
 ---
 
 ## First Run
 
-1. **Login to Indeed manually:**
-    - Run the bot:
-      ```bash
-      python indeed_bot.py
-      ```
-    - If not logged in, the bot will open Indeed and prompt you to log in manually.
-    - After logging in, close the bot and restart it.
+1. **Log in manually.** Run the bot:
+    ```bash
+    python indeed_bot.py
+    ```
+    If no session cookie is found it opens Indeed and waits for you to log in. Press Enter afterwards and **restart the bot** — the session is now saved in `user_data_dir`.
 
-2. **Run the bot again:**
-    - The bot will now use your saved session to search and apply for jobs. 
-    - All your session data (cookies, login info) will be preserved in the `user_data_dir` specified in `config.yaml`.
+2. **Run it again.** It will reuse that session.
 
+> **One browser instance at a time.** `user_data_dir` holds a lock while the bot runs. If a previous run was killed instead of closed, Firefox refuses to start and you will see *"Camoufox is already running, but is not responding."* Delete `user_data_dir/lock` (and `.parentlock`), or close any leftover browser window, then retry.
+
+---
 
 ## Usage
 
-- The bot will:
-  - Visit each search results page.
-  - Collect all jobs with "Indeed Apply".
-  - For each job:
-    - Open the job page in a new tab.
-    - Click "Apply" or "Postuler maintenant".
-    - Step through the application wizard, selecting your uploaded CV and clicking "Continue"/"Submit".
-    - Log the result in `indeed_apply.log`.
+```bash
+python indeed_bot.py
+```
+
+The bot will:
+
+1. Open the browser and verify your Indeed session.
+2. Visit each search results page and collect all "Indeed Apply" jobs.
+3. Deduplicate them by title + URL.
+4. If the AI gate is on, ask the model about each title and keep only the ones it answers `true` for.
+5. For each surviving job, open it in a new tab, click **Apply now**, and step through the wizard — clicking **Continue**, answering any captcha, and submitting.
+6. Print a summary: `Done. Applied: N, failed/skipped: M, of K selected.`
+
+You will be prompted to press Enter whenever manual input is needed (captcha, unanswered form fields, or discarding a job — type `n`).
+
+---
+
+## The AI gate
+
+`ai_evaluation.py` calls `{base_url}/chat/completions` **once per job title**, asking whether that title matches `user_profile_prompt`. The model is instructed to answer with a single word, and the gate is strict:
+
+| Model replies | Result |
+|---|---|
+| `true`, `True`, `  TRUE  ` | apply |
+| `false`, `yes`, `true.`, `sure, true`, empty | skip |
+| request fails / times out / bad JSON | skip, with a warning |
+
+Skipping on failure is deliberate — the bot never applies to a job it could not evaluate. If the endpoint is down, every job is skipped and the log says `AI evaluation unavailable … (ConnectionError)`.
+
+Set `user_profile_prompt: ""` to turn the gate off completely.
+
+---
+
+## Platform support
+
+Camoufox ships builds for all three desktop platforms — `OS_MAP` in its package maps `darwin`, `linux` and `win32`, and `ARCH_MAP` covers `x86_64`, `i686` and `arm64` (Apple Silicon and ARM Linux included).
+
+| Platform | Status | Notes |
+|---|---|---|
+| Linux x86_64 / ARM | Supported | Needs `xvfb` installed if you run headless. |
+| macOS Intel / Apple Silicon | Supported | Native ARM builds. |
+| Windows x86_64 | Supported | Use `.venv\Scripts\activate` instead of `source`. |
+
+The bot's own code uses nothing platform-specific — no `os.system`, no `subprocess`, no POSIX-only `select` (the earlier `select`-based prompt helper was removed for this reason).
+
+**One real portability caveat:** the captcha clicks use hardcoded pixel coordinates (`page.mouse.click(627, 215)` and `(589, 2688)`). These assume a particular window size. On a different resolution those clicks land somewhere else, and you may need to solve captchas manually. Everything else is resolution-independent.
 
 
 ## Notes & Limitations
 
-- This bot only works for jobs with "Indeed Apply" (Candidature simplifiée).
-- If you encounter captchas or anti-bot protections, this bot should handle them automatically, but you may need to solve them manually.
-- Indeed may change their website at any time, which could break this bot.
-- Use responsibly and do not spam applications.
-- This program is a guide on how to automate job applications,  you need to make some modifications to the code to make it work for your needs.
+- Only works for jobs with "Indeed Apply".
+- Captcha handling is best-effort — the coordinates are tuned for one window size, and some captchas need you.
+- Indeed changes its site regularly; selectors like `APPLY_BTN_XPATH` are brittle and will need updating.
+- The AI gate only sees the job **title** — not the description, company, or salary.
+- Run it with judgment. Do not spam applications; bulk submitting is a good way to get your account restricted.
 
 ---
 
 ## Troubleshooting
 
-- If the bot gets stuck or fails to apply:
-  - Check `indeed_apply.log` for errors.
-  - Make sure your CV and personal info are uploaded to Indeed.
-  - Try increasing wait times if your internet is slow.
+| Symptom | Fix |
+|---|---|
+| *"Camoufox is already running, but is not responding"* | A previous run is still alive. Close the browser, or delete `user_data_dir/lock`. |
+| `Found 0 Indeed Apply jobs` | Wrong `language`/`base_url` mismatch, or a cloudflare page that never resolved. Check `base_url` opens in a normal browser. |
+| *"AI evaluation unavailable"* | Your endpoint at `base_url` is down. Verify with the curl command in `ai_evaluation.py`'s header comment. |
+| Click fails with `Timeout 30000ms exceeded` | Increase `SEARCH_SETTLE_SECONDS` / `JOB_PAGE_SETTLE_SECONDS` at the top of `indeed_bot.py` on a slow connection. |
+| Bot clicks the wrong thing on captchas | Window size differs from the one the coordinates were tuned for. |
+| `'NoneType' object has no attribute 'click'` | Indeed changed the job page layout; update `APPLY_BTN_XPATH` or rely on `APPLY_BTN_SELECTOR`. |
 
 ---
 
@@ -115,4 +166,5 @@ This guide explains how to use this bot. Use at your own risk. Indeed may change
 This project is not affiliated with Indeed. Use at your own risk.
 
 ## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

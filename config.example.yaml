@@ -1,0 +1,27 @@
+# Indeed Auto-Apply Bot Configuration
+# Edit these fields to customize your job search and application process
+
+
+search:
+  base_url: "https://uk.indeed.com/jobs?q=python+developer&l=London"
+
+  start: 0
+  end: 50 # default is 100, you can set it to 1000 or more for larger searches (not recommanded though)
+
+camoufox:
+  user_data_dir: "user_data_dir"
+  language: "uk" # uk, pk, us, fr, de, es, it, nl, pt, pl, ro, tr, ru, cn etc...
+
+
+# AI gate: a job is only applied to when the model answers exactly "true".
+# Leave user_profile_prompt empty to disable the gate entirely.
+ai:
+  enabled: false
+  base_url: "http://localhost:8081/v1"
+  model: "gemini-3.5-flash"
+  api_key: "sk-your-key" # replace with your own key
+  timeout: 20
+  user_profile_prompt: |
+    I am a Python backend developer with hands-on experience in FastAPI,
+    Django, Flask, PostgreSQL, Redis, and Docker. Looking for full-time backend
+    or software engineering roles.
