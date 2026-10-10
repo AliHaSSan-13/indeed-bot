@@ -28,7 +28,7 @@ This guide explains how to use this bot. Use at your own risk. Indeed may change
 
 1. **Clone and install:**
     ```bash
-    git clone <your-repo-url>
+    git clone https://github.com/AliHaSSan-13/indeed-bot.git
     cd indeed_bot
     python -m venv .venv
     source .venv/bin/activate        # Windows: .venv\Scripts\activate
