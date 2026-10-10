@@ -200,9 +200,12 @@ def scrape_page(page, url, language, logger):
     print(f"Visiting URL: {url}")
     page.goto(url)
     page.wait_for_load_state("domcontentloaded")
-    print(
-        "Waiting for page to load, if any cloudflare protection button appears... please click it.")
-    #----------Will be adding auto detector and resolver for this
+    if page.title() == "Just a moment...":
+            print("Solving CAPTCHA...")
+            page.wait_for_load_state("networkidle")
+            page.mouse.click(627,215)
+            print("CAPTCHA solved! 🎉")
+            time.sleep(JOB_PAGE_SETTLE_SECONDS)
     time.sleep(SEARCH_SETTLE_SECONDS)
 
     try:
