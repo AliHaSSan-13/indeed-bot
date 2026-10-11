@@ -98,6 +98,7 @@ def start_browser(camoufox_config):
         user_data_dir=camoufox_config.get("user_data_dir"),
         persistent_context=True,
         humanize=True,
+        disable_coop=True,
     )
 
 
@@ -203,7 +204,7 @@ def scrape_page(page, url, language, logger):
     if page.title() == "Just a moment...":
             print("Solving CAPTCHA...")
             page.wait_for_load_state("networkidle")
-            page.mouse.click(627,215)
+            page.mouse.click(640,212)
             print("CAPTCHA solved! 🎉")
             time.sleep(JOB_PAGE_SETTLE_SECONDS)
     time.sleep(SEARCH_SETTLE_SECONDS)
@@ -224,7 +225,7 @@ def click_apply_now(page):
     if page.title() == "Just a moment...":
         print("Solving CAPTCHA...")
         page.wait_for_load_state("networkidle")
-        page.mouse.click(627,215)
+        page.mouse.click(640,212)
         print("CAPTCHA solved! 🎉")
         time.sleep(JOB_PAGE_SETTLE_SECONDS)
     apply_btn = page.query_selector(f"xpath={APPLY_BTN_XPATH}")
@@ -360,7 +361,7 @@ def open_job_page(browser, job_url, settle_seconds=JOB_PAGE_SETTLE_SECONDS, lang
         if page.title() == "Just a moment...":
             print("Solving CAPTCHA...")
             page.wait_for_load_state("networkidle")
-            page.mouse.click(627, 215)
+            page.mouse.click(640,212)
             time.sleep(settle_seconds)
             if page.title() == "Just a moment...":
                 print("CAPTCHA not solved, Discarding job...")
