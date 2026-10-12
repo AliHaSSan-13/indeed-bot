@@ -16,6 +16,7 @@ import logging
 import re
 import sys
 import time
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 from camoufox.sync_api import Camoufox
@@ -177,6 +178,29 @@ def collect_indeed_apply_links(page, language = "www"):
                 jobs.append((extract_job_title(link), job_url))
                 
     return jobs
+
+
+def job_key(job_url):
+    """Indeed's stable per-job id.
+
+    The rc/clk link carries per-render tracking state (bb=, xkcb=, fccid=, vjs=)
+    that Indeed regenerates every time the same job is rendered, so two URLs for
+    one job are never equal. Only jk survives between renders.
+    """
+    jk = parse_qs(urlparse(job_url).query).get("jk")
+    return jk[0] if jk else job_url
+
+
+def dedupe_jobs(jobs):
+    """Drop repeated jobs by job key, keeping the first URL seen for each."""
+    unique = {}
+    for job in jobs:
+        unique.setdefault(job_key(job[1]), job)
+
+    dropped = len(jobs) - len(unique)
+    if dropped:
+        print(f"Dropped {dropped} duplicate job(s).")
+    return list(unique.values())
 
 
 def extract_job_title(link):
@@ -406,7 +430,7 @@ def main():
             time.sleep(PAGE_GAP_SECONDS)
 
         # Dedup the jobs
-        jobs = list(dict.fromkeys(all_jobs))
+        jobs = dedupe_jobs(all_jobs)
         print(f"Total Indeed Apply jobs found: {len(jobs)}")
 
         if ai_enabled(ai_config):
